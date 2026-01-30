@@ -1,0 +1,7 @@
+- name: Install Foreman 3.15 with Katello on RHEL 9
+  hosts: foreman
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: foreman_server

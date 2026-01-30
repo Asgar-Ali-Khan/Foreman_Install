@@ -1,0 +1,196 @@
+- name: Validate OS is RHEL 9 compatible
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.os_family == "RedHat"
+      - ansible_facts.distribution_major_version | int == 9
+    fail_msg: "This playbook supports RHEL/EL 9 only (detected: {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }})."
+
+# Katello quickstart calls out ~20GB memory requirement. [1](https://docs.theforeman.org/3.15/Quickstart/index-katello.html)
+- name: Validate minimum memory for Katello (20 GB)
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.memtotal_mb | int >= 20480
+    fail_msg: "Katello scenario requires ~20 GB RAM (detected: {{ ansible_facts.memtotal_mb }} MB)."
+
+- name: Validate we have a default IPv4 address fact
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.default_ipv4 is defined
+      - ansible_facts.default_ipv4.address is defined
+    fail_msg: "Could not determine default IPv4 address. Ensure networking is configured and facts are available."
+
+- name: Set system hostname to Foreman FQDN
+  ansible.builtin.hostname:
+    name: "{{ foreman_fqdn }}"
+
+# Foreman quickstart warns about hostname resolving to 127.0.1.1; keep best-effort cleanup. [3](https://theforeman.org/manuals/3.15/quickstart_guide.html)
+- name: Remove problematic 127.0.1.1 hostname mapping if present (best effort)
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    state: absent
+    regexp: '^127\.0\.1\.1\s+'
+  ignore_errors: true
+
+- name: Ensure /etc/hosts maps FQDN to the primary IP (best effort)
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    create: true
+    line: "{{ ansible_facts.default_ipv4.address }} {{ foreman_fqdn }} {{ foreman_fqdn.split('.')[0] }}"
+    regexp: '^\d{1,3}(\.\d{1,3}){3}\s+{{ foreman_fqdn | regex_escape() }}(\s+|$)'
+
+- name: Install baseline packages
+  ansible.builtin.dnf:
+    name:
+      - chrony
+      - firewalld
+      - dnf-plugins-core
+      - python3-libselinux
+    state: present
+
+- name: Enable and start chrony
+  ansible.builtin.service:
+    name: chronyd
+    state: started
+    enabled: true
+
+- name: Enable and start firewalld
+  ansible.builtin.service:
+    name: firewalld
+    state: started
+    enabled: true
+
+# Minimum required Katello ports: 80/443/5647/9090 [2](https://downloads.theforeman.org/documentation-archive/katello/katello_3.15_manual.pdf)
+- name: Open required firewall ports
+  ansible.posix.firewalld:
+    port: "{{ item }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: "{{ foreman_firewall_tcp_ports }}"
+
+  # --- Guardrail: detect Foreman latest version & enforce correct Katello pairing ---
+
+- name: Download Foreman release RPM (latest stable symlink)
+  ansible.builtin.get_url:
+    url: "{{ foreman_release_rpm_url }}"
+    dest: /tmp/foreman-release-latest.rpm
+    mode: "0644"
+  register: foreman_release_rpm_dl
+
+- name: Read Foreman release RPM version (without installing)
+  ansible.builtin.command: rpm -qp --queryformat "%{VERSION}\n" /tmp/foreman-release-latest.rpm
+  register: foreman_release_rpm_ver
+  changed_when: false
+
+- name: Derive Foreman major.minor from RPM version
+  ansible.builtin.set_fact:
+    foreman_detected_mm: "{{ (foreman_release_rpm_ver.stdout | trim) | regex_search('^([0-9]+\\.[0-9]+)', '\\1') }}"
+  changed_when: false
+
+- name: Fail if Foreman major.minor could not be detected
+  ansible.builtin.assert:
+    that:
+      - foreman_detected_mm is not none
+      - foreman_detected_mm | length > 0
+    fail_msg: >
+      Could not parse Foreman major.minor from RPM version '{{ foreman_release_rpm_ver.stdout | trim }}'.
+      The RPM from /releases/latest should be a stable Foreman release. [1](https://docs.theforeman.org/3.4/Quickstart/index-katello.html)
+
+- name: Fail if detected Foreman version is not in supported Foreman↔Katello map
+  ansible.builtin.assert:
+    that:
+      - foreman_katello_supported_map[foreman_detected_mm] is defined
+    fail_msg: >
+      Detected Foreman {{ foreman_detected_mm }} from /releases/latest,
+      but there is no supported Katello mapping for it in 'foreman_katello_supported_map'.
+      Update the map based on supported releases (e.g., Foreman 3.17↔Katello 4.19, Foreman 3.16↔Katello 4.18). [2](https://archyslife.blogspot.com/2024/12/foreman-upgrade-from-el8-to-el9-using.html)[1](https://docs.theforeman.org/3.4/Quickstart/index-katello.html)
+
+- name: Auto-select Katello version when katello_version=auto
+  ansible.builtin.set_fact:
+    katello_version: "{{ foreman_katello_supported_map[foreman_detected_mm] }}"
+  when: katello_version | lower == "auto"
+
+- name: Validate pinned Katello version matches detected Foreman version
+  ansible.builtin.assert:
+    that:
+      - katello_version == foreman_katello_supported_map[foreman_detected_mm]
+    fail_msg: >
+      Version mismatch: detected Foreman {{ foreman_detected_mm }} (from /releases/latest) requires
+      Katello {{ foreman_katello_supported_map[foreman_detected_mm] }}, but katello_version is set to {{ katello_version }}.
+      Katello must match Foreman and has no "latest" symlink. [2](https://archyslife.blogspot.com/2024/12/foreman-upgrade-from-el8-to-el9-using.html)[1](https://docs.theforeman.org/3.4/Quickstart/index-katello.html)
+  when: katello_version | lower != "auto"
+
+- name: Build Katello repos RPM URL from resolved katello_version
+  ansible.builtin.set_fact:
+    katello_repos_rpm_url: "https://yum.theforeman.org/katello/{{ katello_version }}/katello/el9/x86_64/katello-repos-latest.rpm"
+  changed_when: false
+
+# Repos: Foreman release RPM + Katello repos RPM + Puppet release RPM [1](https://docs.theforeman.org/3.15/Quickstart/index-katello.html)
+- name: Clean DNF metadata
+  ansible.builtin.command: dnf clean all
+  changed_when: false
+
+- name: Install Puppet release repository RPM (Puppet 8)
+  ansible.builtin.dnf:
+    name: "{{ puppet_release_rpm_url }}"
+    state: present
+    disable_gpg_check: false
+
+- name: Install Foreman release repository RPM (downloaded latest stable)
+  ansible.builtin.dnf:
+    name: /tmp/foreman-release-latest.rpm
+    state: present
+    disable_gpg_check: false
+
+- name: Install Katello repositories RPM (Katello 4.17 for EL9)
+  ansible.builtin.dnf:
+    name: "{{ katello_repos_rpm_url }}"
+    state: present
+    disable_gpg_check: false
+
+- name: Update all packages (recommended before installing Foreman/Katello)
+  ansible.builtin.dnf:
+    name: "*"
+    state: latest
+    update_cache: true
+
+# Katello quickstart: install foreman-installer-katello [1](https://docs.theforeman.org/3.15/Quickstart/index-katello.html)
+- name: Install foreman-installer-katello package
+  ansible.builtin.dnf:
+    name: foreman-installer-katello
+    state: present
+
+# Idempotency marker for Katello scenario answers
+- name: Check if Katello answers file exists (install marker)
+  ansible.builtin.stat:
+    path: /etc/foreman-installer/scenarios.d/katello-answers.yaml
+  register: katello_answers
+
+# Katello quickstart: run foreman-installer --scenario katello [1](https://docs.theforeman.org/3.15/Quickstart/index-katello.html)
+- name: Run Foreman installer (Katello scenario)
+  ansible.builtin.command: >
+    foreman-installer {{ foreman_installer_options | join(' ') }}
+  register: foreman_installer_run
+  changed_when: foreman_installer_run.rc == 0
+  when: foreman_force_installer_run or not katello_answers.stat.exists
+
+- name: Wait for HTTPS to become reachable
+  ansible.builtin.wait_for:
+    port: 443
+    host: "{{ foreman_fqdn }}"
+    timeout: 1200
+
+- name: Validate Foreman/Katello UI responds over HTTPS (ignore cert validation for self-signed)
+  ansible.builtin.uri:
+    url: "https://{{ foreman_fqdn }}/"
+    method: GET
+    validate_certs: false
+    status_code: [200, 302, 401]
+  register: foreman_ui_check
+
+- name: Show helpful post-install info
+  ansible.builtin.debug:
+    msg:
+      - "Katello should be available at: https://{{ foreman_fqdn }}/"
+      - "Installer log: /var/log/foreman-installer/katello.log"  # [1](https://docs.theforeman.org/3.15/Quickstart/index-katello.html)
+      - "Login: admin / (password you set in foreman_initial_admin_password)"

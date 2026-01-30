@@ -1,0 +1,27 @@
+# Foreman "latest stable" symlink (always points to latest stable) [1](https://docs.theforeman.org/3.4/Quickstart/index-katello.html)
+foreman_release_rpm_url: "https://yum.theforeman.org/releases/latest/el9/x86_64/foreman-release.rpm"
+
+# Katello has NO "latest" symlink; must match Foreman version. We'll auto-pick it. [1](https://docs.theforeman.org/3.4/Quickstart/index-katello.html)
+katello_version: "auto"
+
+# Puppet repo RPM (Puppet 8 is used in EL9 instructions) [3](https://docs.theforeman.org/release/3.15/)
+puppet_release_rpm_url: "https://yum.puppet.com/puppet8-release-el-9.noarch.rpm"
+
+# Identity
+foreman_fqdn: "foreman.ore-us.net"
+foreman_initial_admin_password: "OreAdmin!23"
+
+# Required inbound ports for Katello external connections [4](https://downloads.theforeman.org/documentation-archive/katello/katello_3.15_manual.pdf)
+foreman_firewall_tcp_ports:
+  - 80
+  - 443
+  - 5647
+  - 9090
+  - 8140   # optional but common if using Puppet agents
+
+foreman_force_installer_run: false
+
+foreman_installer_options:
+  - "--scenario katello"  # Katello scenario install [3](https://docs.theforeman.org/release/3.15/)
+  - "--foreman-servername={{ foreman_fqdn }}"
+  - "--foreman-initial-admin-password={{ foreman_initial_admin_password }}"

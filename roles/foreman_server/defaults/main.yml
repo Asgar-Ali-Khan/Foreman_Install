@@ -1,0 +1,23 @@
+# Foreman "latest stable" symlink [1](https://docs.theforeman.org/3.4/Quickstart/index-katello.html)
+foreman_release_rpm_url: "https://yum.theforeman.org/releases/latest/el9/x86_64/foreman-release.rpm"
+
+# Katello must be version matched to Foreman; no latest symlink. [1](https://docs.theforeman.org/3.4/Quickstart/index-katello.html)
+katello_version: "auto"
+
+# Supported combos per docs (update as new supported versions appear). [2](https://archyslife.blogspot.com/2024/12/foreman-upgrade-from-el8-to-el9-using.html)
+foreman_katello_supported_map:
+  "3.17": "4.19"
+  "3.16": "4.18"
+
+puppet_release_rpm_url: "https://yum.puppet.com/puppet8-release-el-9.noarch.rpm"  # [3](https://docs.theforeman.org/release/3.15/)
+
+foreman_fqdn: "{{ inventory_hostname }}"
+foreman_initial_admin_password: "OreAdmin!23"
+
+foreman_firewall_tcp_ports: [80, 443, 5647, 9090]
+foreman_force_installer_run: false
+
+foreman_installer_options:
+  - "--scenario katello"  # [3](https://docs.theforeman.org/release/3.15/)
+  - "--foreman-servername={{ foreman_fqdn }}"
+  - "--foreman-initial-admin-password={{ foreman_initial_admin_password }}"
